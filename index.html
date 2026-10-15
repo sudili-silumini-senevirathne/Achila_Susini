@@ -963,7 +963,7 @@ body.rsvp-modal-open {
           <button type="submit" class="rsvp-button">SEND RSVP</button>
           <p class="form-result" id="formResult" aria-live="polite"></p>
         </form>
-        <p class="demo-note">Demo invitation preview</p>
+        <p class="demo-note">Personalized invitation • RSVP securely recorded</p>
       </div>
     </section>
 
@@ -998,6 +998,10 @@ body.rsvp-modal-open {
 
 const WEDDING_DATE = new Date('2027-05-16T09:00:00+05:30');
 
+// Paste the Google Apps Script Web App /exec URL here after deployment.
+// Production RSVP service connected to the deployed Google Apps Script Web App.
+const RSVP_API_URL = 'https://script.google.com/macros/s/AKfycbwkKO_vfgb86_3o-MWw9rqbsFTgx98BcBpYo-ryMls3VCmLWPCfd2j3NpingLgqL50d/exec';
+
 // Auto-scroll behavior:
 // - starts after opening
 // - works with a fractional internal position so slow scrolling also works on iOS
@@ -1029,20 +1033,137 @@ const rsvpModalTitle = document.getElementById('rsvpModalTitle');
 const rsvpModalMessage = document.getElementById('rsvpModalMessage');
 const rsvpModalMark = document.getElementById('rsvpModalMark');
 
-// Personalized demo link support: ?name=Miss%20Sudili&max=2
+// =========================================================
+// PERSONALIZED GUEST LOOKUP
+// Production link format: ?i=INVITATION_ID
+// The server is authoritative for GuestName and MaxGuests.
+// =========================================================
 const params = new URLSearchParams(location.search);
-const displayName = (params.get('name') || 'Our Dear Guest').trim();
-const maxGuests = Math.max(1, Math.min(10, Number(params.get('max') || 2) || 2));
+const invitationId = (params.get('i') || '').trim();
+let displayName = (params.get('name') || 'Our Dear Guest').trim();
+let maxGuests = Math.max(1, Math.min(10, Number(params.get('max') || 2) || 2));
+let guestVerified = false;
 
-guestName.textContent = displayName;
-rsvpName.value = displayName;
+const rsvpSubmitButton = rsvpForm.querySelector('.rsvp-button');
+const guestMessage = document.getElementById('guestMessage');
 
-for (let i = 1; i <= maxGuests; i += 1) {
-  const option = document.createElement('option');
-  option.value = String(i);
-  option.textContent = i === 1 ? '1 Guest' : `${i} Guests`;
-  guestCount.appendChild(option);
+function apiConfigured() {
+  return Boolean(RSVP_API_URL) && !RSVP_API_URL.includes('PASTE_YOUR_');
 }
+
+function populateGuestCount(limit) {
+  guestCount.innerHTML = '';
+  const safeLimit = Math.max(1, Math.min(10, Number(limit) || 1));
+
+  for (let i = 1; i <= safeLimit; i += 1) {
+    const option = document.createElement('option');
+    option.value = String(i);
+    option.textContent = i === 1 ? '1 Guest' : `${i} Guests`;
+    guestCount.appendChild(option);
+  }
+}
+
+function applyGuest(name, limit) {
+  displayName = String(name || 'Our Dear Guest').trim() || 'Our Dear Guest';
+  maxGuests = Math.max(1, Math.min(10, Number(limit) || 1));
+  guestName.textContent = displayName;
+  rsvpName.value = displayName;
+  populateGuestCount(maxGuests);
+}
+
+function setFormMessage(message, isError = false) {
+  formResult.textContent = message || '';
+  formResult.style.display = message ? 'block' : 'none';
+  formResult.style.color = isError ? '#8b3f45' : '';
+}
+
+function setRsvpEnabled(enabled) {
+  rsvpSubmitButton.disabled = !enabled;
+  rsvpSubmitButton.style.opacity = enabled ? '1' : '.58';
+  rsvpSubmitButton.style.cursor = enabled ? 'pointer' : 'not-allowed';
+}
+
+function jsonpRequest(action, payload = {}, timeoutMs = 12000) {
+  return new Promise((resolve, reject) => {
+    if (!apiConfigured()) {
+      reject(new Error('RSVP service is not configured yet.'));
+      return;
+    }
+
+    const callbackName = `InviteBloom_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const script = document.createElement('script');
+    const query = new URLSearchParams({
+      action,
+      callback: callbackName,
+      ...payload,
+      _: String(Date.now())
+    });
+
+    let finished = false;
+
+    function cleanup() {
+      if (finished) return;
+      finished = true;
+      window.clearTimeout(timer);
+      script.remove();
+      try { delete window[callbackName]; } catch (error) { window[callbackName] = undefined; }
+    }
+
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(new Error('The RSVP service took too long to respond. Please try again.'));
+    }, timeoutMs);
+
+    window[callbackName] = data => {
+      cleanup();
+      if (data && data.ok) {
+        resolve(data);
+      } else {
+        reject(new Error((data && data.message) || 'Unable to complete the request.'));
+      }
+    };
+
+    script.onerror = () => {
+      cleanup();
+      reject(new Error('Unable to reach the RSVP service. Please check your connection and try again.'));
+    };
+
+    const separator = RSVP_API_URL.includes('?') ? '&' : '?';
+    script.src = `${RSVP_API_URL}${separator}${query.toString()}`;
+    document.head.appendChild(script);
+  });
+}
+
+async function loadPersonalizedGuest() {
+  applyGuest(displayName, maxGuests);
+
+  // Demo/portfolio mode remains available until the Apps Script URL is pasted.
+  if (!apiConfigured()) return;
+
+  if (!invitationId) {
+    guestName.textContent = 'Invitation link required';
+    setRsvpEnabled(false);
+    setFormMessage('Please open the personalized invitation link sent to you.', true);
+    return;
+  }
+
+  setRsvpEnabled(false);
+  guestName.textContent = 'Loading your invitation…';
+
+  try {
+    const data = await jsonpRequest('lookup', { i: invitationId });
+    applyGuest(data.guestName, data.maxGuests);
+    guestVerified = true;
+    setRsvpEnabled(true);
+    setFormMessage('');
+  } catch (error) {
+    guestName.textContent = 'Invitation not found';
+    setRsvpEnabled(false);
+    setFormMessage(error.message, true);
+  }
+}
+
+loadPersonalizedGuest();
 
 // =========================================================
 // ENVELOPE OPENING + MUSIC
@@ -1436,18 +1557,53 @@ document.addEventListener('keydown', event => {
   }
 });
 
-rsvpForm.addEventListener('submit', event => {
+rsvpForm.addEventListener('submit', async event => {
   event.preventDefault();
 
   const selected = rsvpForm.querySelector('input[name="attendance"]:checked');
   if (!selected) return;
 
-  formResult.style.display = 'none';
-  openRsvpModal(selected.value);
+  // Keep the portfolio/demo version usable until the live backend URL is pasted.
+  if (!apiConfigured()) {
+    setFormMessage('Demo mode — connect the Google Apps Script URL to save real responses.');
+    openRsvpModal(selected.value);
+    return;
+  }
 
-  // Demo only: no network request is sent yet.
-  // Once the design is approved, the Google Apps Script response can call
-  // openRsvpModal(...) only after the RSVP is successfully saved.
+  if (!invitationId || !guestVerified) {
+    setFormMessage('Please open your personalized invitation link before submitting an RSVP.', true);
+    return;
+  }
+
+  const attendance = selected.value;
+  const numberAttending = attendance === 'Yes' ? Number(guestCount.value || 1) : 0;
+  const message = (guestMessage.value || '').trim().slice(0, 500);
+
+  pauseAutoScroll();
+  setFormMessage('Saving your RSVP…');
+  rsvpSubmitButton.disabled = true;
+  const previousButtonText = rsvpSubmitButton.textContent;
+  rsvpSubmitButton.textContent = 'SENDING…';
+
+  try {
+    const data = await jsonpRequest('rsvp', {
+      i: invitationId,
+      attendance,
+      numberAttending: String(numberAttending),
+      message
+    }, 15000);
+
+    setFormMessage('');
+    openRsvpModal(data.attendance || attendance);
+  } catch (error) {
+    setFormMessage(error.message || 'We could not save your RSVP. Please try again.', true);
+    focusPause = false;
+    syncAutoScrollPosition();
+    scheduleAutoScroll(4500);
+  } finally {
+    rsvpSubmitButton.disabled = false;
+    rsvpSubmitButton.textContent = previousButtonText;
+  }
 });
 
 </script>
